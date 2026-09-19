@@ -1,21 +1,15 @@
 import tempfile
+import zipfile
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-from acv_features import (
-    DEFAULT_TEST_DIR,
-    DEFAULT_TRAIN_DIR,
-    DEFAULT_TRAIN_LABELS,
-    discover_workbooks,
-    explain_top_pick,
-    get_or_train_model,
-    load_case,
-    score_file,
-)
+from acv_features import explain_top_pick, get_or_train_model, load_case, score_file
+from components.styles import inject_download_button_style
 
 st.set_page_config(page_title="ACV | NebulaX PS3", page_icon="❄️", layout="wide")
+inject_download_button_style()
 
 
 @st.cache_resource
@@ -23,103 +17,119 @@ def get_model():
     return get_or_train_model()
 
 
-@st.cache_data
-def get_train_labels() -> pd.Series:
-    return pd.read_csv(DEFAULT_TRAIN_LABELS, dtype=str).set_index("filename")["faulty_car"]
+def _is_workbook_zip(archive: zipfile.ZipFile) -> bool:
+    """True if this zip's content IS an .xlsx workbook, not a folder of separate files.
+
+    .xlsx is itself a zip container, so a plain zipfile.is_zipfile() check can't tell
+    "someone uploaded one workbook" from "someone uploaded a zipped folder of workbooks"
+    -- an Office document always has this internal structure, a folder of files won't.
+    """
+    names = archive.namelist()
+    return "[Content_Types].xml" in names or any(n.startswith("xl/") for n in names)
 
 
-def score_workbook(path: Path) -> pd.DataFrame:
-    return score_file(load_case(path), get_model())
+def iter_uploaded_files(uploaded_files):
+    """Yield (file_id, local_path) pairs, expanding any uploaded *folder* zip into its members.
+
+    A browser file input can't open a native folder picker, so "a folder of data" is
+    supported by letting someone zip that folder and upload the archive directly, on
+    top of plain multi-file selection.
+    """
+    tmp_dir = Path(tempfile.mkdtemp())
+    for uploaded in uploaded_files:
+        uploaded.seek(0)
+        is_folder_zip = False
+        if zipfile.is_zipfile(uploaded):
+            uploaded.seek(0)
+            with zipfile.ZipFile(uploaded) as archive:
+                is_folder_zip = not _is_workbook_zip(archive)
+                if is_folder_zip:
+                    for member in archive.namelist():
+                        name = Path(member)
+                        if member.endswith("/") or name.name.startswith((".", "__")):
+                            continue
+                        dest = tmp_dir / name.name
+                        dest.write_bytes(archive.read(member))
+                        yield name.name, dest
+        if not is_folder_zip:
+            uploaded.seek(0)
+            dest = tmp_dir / uploaded.name
+            dest.write_bytes(uploaded.getvalue())
+            yield uploaded.name, dest
 
 
 st.title("ACV subsystem — refrigerant-leak locator")
 st.write(
-    "Upload a train's ACV telemetry workbook (or pick one of the sample cases below) and this "
-    "page will point to the car most likely to have a refrigerant leak, in plain language."
+    "Upload ACV telemetry workbooks -- one, several at once, or a zipped folder of them -- "
+    "to rank each file's cars from most- to least-likely to have the refrigerant leak."
 )
 
-train_paths = discover_workbooks(DEFAULT_TRAIN_DIR)
-test_paths = discover_workbooks(DEFAULT_TEST_DIR)
-train_labels = get_train_labels()
-
-source = st.radio(
-    "Data source",
-    ["Official test case", "Sample training case (answer known)", "Upload a workbook"],
-    horizontal=True,
+uploaded_files = st.file_uploader(
+    "ACV telemetry workbook(s) (any filename accepted -- content is what's checked)",
+    accept_multiple_files=True,
 )
 
-workbook_path: Path | None = None
-true_car: str | None = None
-
-if source == "Official test case":
-    workbook_path = test_paths[0] if test_paths else None
-elif source == "Sample training case (answer known)":
-    labels_lookup = {p.name: p for p in train_paths}
-    chosen_name = st.selectbox("Training case", sorted(labels_lookup))
-    workbook_path = labels_lookup[chosen_name]
-    true_car = train_labels.get(chosen_name)
+if not uploaded_files:
+    st.info("Upload one or more workbooks to see predictions.")
 else:
-    uploaded = st.file_uploader(
-        "ACV telemetry workbook (any filename accepted -- content is what's checked)"
-    )
-    if uploaded is not None:
-        tmp_dir = Path(tempfile.mkdtemp())
-        workbook_path = tmp_dir / uploaded.name
-        workbook_path.write_bytes(uploaded.getvalue())
-
-if workbook_path is None:
-    st.info("Choose a sample case or upload a workbook to see a prediction.")
-else:
+    model = get_model()
+    results: dict[str, pd.DataFrame] = {}
     with st.spinner("Scoring every car against its peers..."):
-        ranked = score_workbook(workbook_path)
-    top_car = ranked.index[0]
-    top = ranked.iloc[0]
+        for file_id, path in iter_uploaded_files(uploaded_files):
+            try:
+                results[file_id] = score_file(load_case(path), model)
+            except Exception as exc:
+                st.warning(f"Skipped {file_id}: couldn't read it as ACV telemetry ({exc}).")
 
-    with st.container(border=True):
-        st.subheader(f"Most likely fault: Car {top_car}")
-        st.progress(min(max(top["probability"], 0.0), 1.0), text=f"Estimated probability: {top['probability']:.0%}")
-        st.write(explain_top_pick(ranked))
-        if true_car is not None:
-            if true_car == top_car:
-                st.success(f"Matches the documented answer for this case (Car {true_car}).")
-            else:
-                st.warning(f"Documented answer for this case is Car {true_car}.")
+    if not results:
+        st.error("None of the uploaded files could be read as ACV telemetry.")
+    else:
+        for file_id, ranked in results.items():
+            top_car = ranked.index[0]
+            top = ranked.iloc[0]
+            with st.container(border=True):
+                st.subheader(f"{file_id}: most likely fault Car {top_car}")
+                st.progress(min(max(top["probability"], 0.0), 1.0), text=f"Estimated probability: {top['probability']:.0%}")
+                st.write(explain_top_pick(ranked))
 
-    st.markdown("#### Full ranking")
-    display = ranked.reset_index().rename(columns={
-        "car_id": "Car",
-        "cooling_gap": "Avg. temp above setpoint while cooling (°C)",
-        "z_score": "Peer z-score",
-        "probability": "Leak probability",
-        "rank": "Rank",
-    })
-    display["Leak probability"] = display["Leak probability"].map(lambda v: f"{v:.0%}")
-    st.dataframe(display.set_index("Rank"), width="stretch")
-    st.bar_chart(ranked["probability"], y_label="Leak probability")
+                display = ranked.reset_index().rename(columns={
+                    "car_id": "Car",
+                    "cooling_gap": "Avg. temp above setpoint while cooling (°C)",
+                    "z_score": "Peer z-score",
+                    "probability": "Leak probability",
+                    "rank": "Rank",
+                })
+                display["Leak probability"] = display["Leak probability"].map(lambda v: f"{v:.0%}")
+                st.dataframe(display.set_index("Rank"), width="stretch")
+                st.bar_chart(ranked["probability"], y_label="Leak probability")
 
-    st.download_button(
-        "Download this result as CSV",
-        pd.DataFrame({"file_id": [workbook_path.name], "ranked_cars": ["|".join(ranked.index)]}).to_csv(index=False),
-        file_name="acv_predictions.csv",
-        mime="text/csv",
-    )
-
-    with st.expander("How this works"):
-        st.markdown(
-            "- One number per car: how far its cabin temperature sits above its own cooling "
-            "setpoint while actively cooling, compared to its 7 peers in the same file. Rows the "
-            "file itself flags `Invalid` are excluded first.\n"
-            "- That gap is the textbook signature of reduced cooling capacity from a refrigerant "
-            "leak; it's converted into a probability by a single-feature logistic regression "
-            "trained on the documented leak cases (loaded from a saved model artifact, "
-            "`acv_model.joblib`, when present).\n"
-            "- One of the six labeled training files uses an entirely different, much richer "
-            "column layout the feature can't be computed from, so it's excluded from training "
-            "rather than special-cased.\n"
-            "- Validated with leave-one-file-out cross-validation across the five usable labeled "
-            "files: every one ranks the true faulty car 1st.\n"
-            "- Full methodology and validation: [acv_eda.ipynb](../acv_eda.ipynb)."
+        predictions = pd.DataFrame(
+            {"file_id": file_id, "ranked_cars": "|".join(ranked.index)}
+            for file_id, ranked in results.items()
         )
+        st.download_button(
+            "Download predictions.csv",
+            predictions.to_csv(index=False),
+            file_name="acv_predictions.csv",
+            mime="text/csv",
+        )
+
+        with st.expander("How this works"):
+            st.markdown(
+                "- One number per car: how far its cabin temperature sits above its own cooling "
+                "setpoint while actively cooling, compared to its 7 peers in the same file. Rows "
+                "the file itself flags `Invalid` are excluded first.\n"
+                "- That gap is the textbook signature of reduced cooling capacity from a "
+                "refrigerant leak; it's converted into a probability by a single-feature logistic "
+                "regression trained on the documented leak cases (loaded from a saved model "
+                "artifact, `acv_model.joblib`, when present).\n"
+                "- One of the six labeled training files uses an entirely different, much richer "
+                "column layout the feature can't be computed from, so it's excluded from training "
+                "rather than special-cased.\n"
+                "- Validated with leave-one-file-out cross-validation across the five usable "
+                "labeled files: every one ranks the true faulty car 1st.\n"
+                "- Full methodology and validation: [acv_eda.ipynb](../acv_eda.ipynb)."
+            )
 
 if st.button("← Back to overview", type="secondary"):
     st.switch_page("app.py")
