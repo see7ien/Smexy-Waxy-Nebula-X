@@ -2,15 +2,19 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 import rail_predict as rc
 from components.styles import inject_download_button_style
+from components.theme import THEME
 
 st.set_page_config(page_title="Rail Corrugation | NebulaX PS3", page_icon="🛤️", layout="wide")
 inject_download_button_style()
+
+CLASS_COLORS = {"Normal": THEME["success"], "Side I": THEME["warning"], "Side II": THEME["rail_red"]}
 
 
 @st.cache_resource
@@ -19,25 +23,37 @@ def get_model_bundle() -> dict:
 
 
 def iter_uploaded_files(uploaded_files):
-    """Yield (file_id, local_path) pairs, expanding any uploaded zip archive into its members."""
+    """Yield (file_id, local_path) pairs, expanding any uploaded zip archive into its members.
+
+    A problem with one uploaded item (a corrupted zip, an unreadable member) is reported
+    and skipped rather than raised -- previously an error here aborted the whole batch
+    instead of just the offending file, since it happened outside predict_file's own
+    try/except.
+    """
     tmp_dir = Path(tempfile.mkdtemp())
     for uploaded in uploaded_files:
-        uploaded.seek(0)
-        if zipfile.is_zipfile(uploaded):
+        try:
             uploaded.seek(0)
-            with zipfile.ZipFile(uploaded) as archive:
-                for member in archive.namelist():
-                    name = Path(member)
-                    if member.endswith("/") or name.name.startswith((".", "__")):
-                        continue
-                    dest = tmp_dir / name.name
-                    dest.write_bytes(archive.read(member))
-                    yield name.name, dest
-        else:
-            uploaded.seek(0)
-            dest = tmp_dir / uploaded.name
-            dest.write_bytes(uploaded.getvalue())
-            yield uploaded.name, dest
+            if zipfile.is_zipfile(uploaded):
+                uploaded.seek(0)
+                with zipfile.ZipFile(uploaded) as archive:
+                    for member in archive.namelist():
+                        name = Path(member)
+                        if member.endswith("/") or name.name.startswith((".", "__")):
+                            continue
+                        try:
+                            dest = tmp_dir / name.name
+                            dest.write_bytes(archive.read(member))
+                            yield name.name, dest
+                        except Exception as exc:
+                            st.warning(f"Skipped {member} inside {uploaded.name}: {exc}")
+            else:
+                uploaded.seek(0)
+                dest = tmp_dir / uploaded.name
+                dest.write_bytes(uploaded.getvalue())
+                yield uploaded.name, dest
+        except Exception as exc:
+            st.warning(f"Skipped {uploaded.name}: couldn't read it as a file or archive ({exc}).")
 
 
 def predict_file(path: Path) -> tuple[str, pd.Series]:
@@ -81,7 +97,22 @@ else:
     if not results:
         st.error("None of the uploaded files could be scored.")
     else:
-        st.markdown("#### Overview")
+        st.markdown("#### Corrugation distribution")
+        counts = pd.Series([prediction for prediction, _ in results.values()]).value_counts()
+        fig, ax = plt.subplots(figsize=(2.2, 2.2))
+        ax.pie(
+            counts.values,
+            labels=counts.index,
+            colors=[CLASS_COLORS.get(label, THEME["text_secondary"]) for label in counts.index],
+            autopct="%1.0f%%",
+            startangle=90,
+            textprops={"fontsize": 7},
+        )
+        ax.set_title(f"{len(results)} file(s) classified", fontsize=8)
+        pie_col, _ = st.columns([1, 3])
+        pie_col.pyplot(fig)
+
+        st.markdown("#### Predictions Preview")
         overview = pd.DataFrame(
             {
                 "file_id": file_id,
@@ -95,12 +126,6 @@ else:
             width="stretch",
             hide_index=True,
         )
-
-        st.markdown("#### Per-file detail")
-        st.write("Click a file below to see its full Normal / Side I / Side II breakdown.")
-        for file_id, (prediction, proba) in results.items():
-            with st.expander(f"{file_id}: {prediction} ({proba[prediction]:.0%} confidence)"):
-                st.bar_chart(proba, y_label="Probability")
 
         predictions = pd.DataFrame(
             {"file_id": file_id, "prediction": prediction}

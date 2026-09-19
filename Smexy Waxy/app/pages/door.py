@@ -29,52 +29,61 @@ def with_timing(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def render_abnormal_pie(ax, sub_df: pd.DataFrame, label: str) -> None:
+    abnormal = int((sub_df["prediction"] == "Abnormal resistance").sum())
+    normal = len(sub_df) - abnormal
+    ax.pie(
+        [normal, abnormal],
+        labels=["Normal", "Abnormal"],
+        colors=[THEME["success"], ACCENT],
+        autopct="%1.0f%%",
+        startangle=90,
+    )
+    ax.set_title(f"{label} (n={len(sub_df)})")
+
+
 def render_dashboard(df: pd.DataFrame) -> None:
     total = len(df)
     abnormal = int((df["prediction"] == "Abnormal resistance").sum())
 
     cols = st.columns(4)
-    cols[0].metric("Total cycles", total)
+    cols[0].metric("Total segments", total)
     cols[1].metric("Normal", total - abnormal)
     cols[2].metric("Abnormal resistance", abnormal)
     cols[3].metric("Abnormal rate", f"{abnormal / total:.1%}" if total else "—")
 
-    st.markdown("#### Cycle duration over time")
-    fig, ax = plt.subplots(figsize=(11, 3))
-    colors = df["prediction"].map({"Normal": THEME["success"], "Abnormal resistance": ACCENT})
-    x = range(len(df))
-    ax.bar(x, df["duration_s"], color=colors)
-    ax.set_ylabel("Duration (s)")
-    step = max(1, len(df) // 12)
-    ticks = list(x)[::step]
-    ax.set_xticks(ticks)
-    ax.set_xticklabels(df["start_display"].iloc[::step], rotation=30, ha="right", fontsize=8)
-    ax.set_title("Each bar is one detected door cycle (red = abnormal resistance)", fontsize=10)
-    fig.tight_layout()
-    st.pyplot(fig)
+    st.markdown("#### Abnormal rate by operation")
+    operations = sorted(df["operation"].dropna().unique())
+    if len(operations) >= 2:
+        pie_cols = st.columns(len(operations))
+        for col, op in zip(pie_cols, operations):
+            fig, ax = plt.subplots(figsize=(4, 4))
+            render_abnormal_pie(ax, df[df["operation"] == op], op)
+            col.pyplot(fig)
+    elif len(operations) == 1:
+        fig, ax = plt.subplots(figsize=(4, 4))
+        render_abnormal_pie(ax, df[df["operation"] == operations[0]], operations[0])
+        st.pyplot(fig)
+    else:
+        st.write("No operation data available to break down.")
 
     display_columns = {
         "start_display": "start",
         "end_display": "end",
-        "prediction": "prediction",
         "duration_s": "duration (s)",
     }
 
-    st.markdown("#### Flagged cycles")
-    flagged = df.loc[df["prediction"] == "Abnormal resistance", ["start_display", "end_display", "duration_s"]]
-    if len(flagged):
-        st.dataframe(
-            flagged.rename(columns=display_columns).round({"duration (s)": 2}),
-            width="stretch",
-        )
-    else:
-        st.write("No abnormal-resistance cycles detected.")
+    abnormal_df = df.loc[df["prediction"] == "Abnormal resistance", list(display_columns)]
+    normal_df = df.loc[df["prediction"] == "Normal", list(display_columns)]
 
-    with st.expander("All cycles"):
-        st.dataframe(
-            df[list(display_columns)].rename(columns=display_columns).round({"duration (s)": 2}),
-            width="stretch",
-        )
+    with st.expander(f"Abnormal segments ({len(abnormal_df)})"):
+        if len(abnormal_df):
+            st.dataframe(abnormal_df.rename(columns=display_columns).round({"duration (s)": 2}), width="stretch")
+        else:
+            st.write("No abnormal-resistance segments detected.")
+
+    with st.expander(f"Normal segments ({len(normal_df)})"):
+        st.dataframe(normal_df.rename(columns=display_columns).round({"duration (s)": 2}), width="stretch")
 
     st.download_button(
         "Download predictions.csv",
@@ -84,20 +93,20 @@ def render_dashboard(df: pd.DataFrame) -> None:
     )
 
 
-st.title("Door subsystem — cycle health")
+st.title("Door subsystem — segment health")
 st.write(
     "Upload a raw door sensor CSV (one row per 20ms sample, with Datetime, "
     "'Motor current(mA)', 'Open command', 'Close command') to detect and classify every "
-    "door-open/close cycle."
+    "door-open/close segment."
 )
 
 uploaded = st.file_uploader("Raw sensor CSV (any filename accepted -- content is what's checked)")
 
 if uploaded is None:
-    st.info("Upload a raw sensor CSV to detect and classify cycles.")
+    st.info("Upload a raw sensor CSV to detect and classify segments.")
 else:
     try:
-        with st.spinner("Detecting door cycles and scoring each one..."):
+        with st.spinner("Detecting door segments and scoring each one..."):
             segments = predict_segments(pd.read_csv(uploaded))
     except ValueError as exc:
         st.error(f"Couldn't read this as raw door sensor data ({exc}).")
