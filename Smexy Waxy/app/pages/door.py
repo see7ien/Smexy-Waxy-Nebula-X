@@ -1,16 +1,15 @@
-from pathlib import Path
-
 import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
+from components.styles import inject_download_button_style
 from components.theme import ACCENT_MAP, THEME
 from door_features import predict_segments
 
 st.set_page_config(page_title="Door | NebulaX PS3", page_icon="🚪", layout="wide")
+inject_download_button_style()
 
 ACCENT = ACCENT_MAP["door"]["color"]
-SAMPLE_PATH = Path(__file__).resolve().parent.parent / "data" / "Door" / "sample_door_predictions.csv"
 
 
 def parse_timestamp(value: str) -> pd.Timestamp:
@@ -23,6 +22,10 @@ def with_timing(df: pd.DataFrame) -> pd.DataFrame:
     df["start"] = df["start_time"].map(parse_timestamp)
     df["end"] = df["end_time"].map(parse_timestamp)
     df["duration_s"] = (df["end"] - df["start"]).dt.total_seconds()
+    # The raw "2023-7-5-0-0-15-5" timestamps are required for the CSV export but
+    # unreadable on screen -- show an ordinary day + time string instead.
+    df["start_display"] = df["start"].dt.strftime("%b %d, %H:%M:%S")
+    df["end_display"] = df["end"].dt.strftime("%b %d, %H:%M:%S")
     return df
 
 
@@ -36,31 +39,45 @@ def render_dashboard(df: pd.DataFrame) -> None:
     cols[2].metric("Abnormal resistance", abnormal)
     cols[3].metric("Abnormal rate", f"{abnormal / total:.1%}" if total else "—")
 
-    st.markdown("#### Cycle timeline")
-    fig, ax = plt.subplots(figsize=(11, 2))
+    st.markdown("#### Cycle duration over time")
+    fig, ax = plt.subplots(figsize=(11, 3))
     colors = df["prediction"].map({"Normal": THEME["success"], "Abnormal resistance": ACCENT})
-    ax.scatter(df["start"], [0] * len(df), c=colors, s=80, marker="|", linewidths=3)
-    ax.set_yticks([])
-    ax.set_xlabel("Time")
-    ax.set_title("Each mark is one detected door cycle (red = abnormal resistance)", fontsize=10)
+    x = range(len(df))
+    ax.bar(x, df["duration_s"], color=colors)
+    ax.set_ylabel("Duration (s)")
+    step = max(1, len(df) // 12)
+    ticks = list(x)[::step]
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(df["start_display"].iloc[::step], rotation=30, ha="right", fontsize=8)
+    ax.set_title("Each bar is one detected door cycle (red = abnormal resistance)", fontsize=10)
     fig.tight_layout()
     st.pyplot(fig)
 
+    display_columns = {
+        "start_display": "start",
+        "end_display": "end",
+        "prediction": "prediction",
+        "duration_s": "duration (s)",
+    }
+
     st.markdown("#### Flagged cycles")
-    flagged = df.loc[df["prediction"] == "Abnormal resistance", ["start_time", "end_time", "duration_s"]]
+    flagged = df.loc[df["prediction"] == "Abnormal resistance", ["start_display", "end_display", "duration_s"]]
     if len(flagged):
-        st.dataframe(flagged.rename(columns={"duration_s": "duration (s)"}), width="stretch")
+        st.dataframe(
+            flagged.rename(columns=display_columns).round({"duration (s)": 2}),
+            width="stretch",
+        )
     else:
         st.write("No abnormal-resistance cycles detected.")
 
     with st.expander("All cycles"):
         st.dataframe(
-            df[["start_time", "end_time", "prediction", "duration_s"]].rename(columns={"duration_s": "duration (s)"}),
+            df[list(display_columns)].rename(columns=display_columns).round({"duration (s)": 2}),
             width="stretch",
         )
 
     st.download_button(
-        "Download this result as CSV",
+        "Download predictions.csv",
         df[["start_time", "end_time", "prediction"]].to_csv(index=False),
         file_name="door_predictions.csv",
         mime="text/csv",
@@ -69,60 +86,35 @@ def render_dashboard(df: pd.DataFrame) -> None:
 
 st.title("Door subsystem — cycle health")
 st.write(
-    "Upload raw door sensor data to detect and classify each open/close cycle, or browse "
-    "pre-computed sample results."
+    "Upload a raw door sensor CSV (one row per 20ms sample, with Datetime, "
+    "'Motor current(mA)', 'Open command', 'Close command') to detect and classify every "
+    "door-open/close cycle."
 )
 
-source = st.radio(
-    "Data source",
-    ["Live prediction (upload raw sensor data)", "Sample predictions", "Upload a predictions CSV"],
-    horizontal=True,
-)
+uploaded = st.file_uploader("Raw sensor CSV (any filename accepted -- content is what's checked)")
 
-if source == "Sample predictions":
-    render_dashboard(with_timing(pd.read_csv(SAMPLE_PATH)))
-elif source == "Upload a predictions CSV":
-    uploaded = st.file_uploader("Predictions file (any filename accepted -- content is what's checked)")
-    if uploaded is None:
-        st.info("Upload a predictions CSV to see the dashboard.")
-    else:
-        try:
-            df = with_timing(pd.read_csv(uploaded))
-        except KeyError as exc:
-            st.error(
-                f"This doesn't look like a door_predictions.csv -- missing column {exc}. "
-                "Expected start_time, end_time, prediction. Raw sensor data goes in "
-                "\"Live prediction\" instead."
-            )
-        else:
-            render_dashboard(df)
+if uploaded is None:
+    st.info("Upload a raw sensor CSV to detect and classify cycles.")
 else:
-    uploaded = st.file_uploader("Raw sensor CSV (any filename accepted -- content is what's checked)")
-    if uploaded is None:
-        st.info(
-            "Upload a raw sensor CSV (one row per 20ms sample, with Datetime, "
-            "'Motor current(mA)', 'Open command', 'Close command') to detect and classify cycles."
-        )
+    try:
+        with st.spinner("Detecting door cycles and scoring each one..."):
+            segments = predict_segments(pd.read_csv(uploaded))
+    except ValueError as exc:
+        st.error(f"Couldn't read this as raw door sensor data ({exc}).")
     else:
-        try:
-            with st.spinner("Detecting door cycles and scoring each one..."):
-                segments = predict_segments(pd.read_csv(uploaded))
-        except ValueError as exc:
-            st.error(f"Couldn't read this as raw door sensor data ({exc}).")
-        else:
-            render_dashboard(with_timing(segments))
+        render_dashboard(with_timing(segments))
 
-            with st.expander("How this works"):
-                st.markdown(
-                    "- Consecutive samples are grouped into door-open/close segments by "
-                    "timestamp gaps and open/close command changes (or by a `segment_id` "
-                    "column, if the file already has one).\n"
-                    "- Each segment's minimum and mean motor current feed a Firth-penalised "
-                    "logistic regression fitted offline on labeled segments "
-                    "(coefficients reproduced in `door_features.py` from `models/door_model.py`).\n"
-                    "- A segment is flagged `Abnormal resistance` when the fitted probability "
-                    "clears a threshold chosen from the labeled data's class gap."
-                )
+        with st.expander("How this works"):
+            st.markdown(
+                "- Consecutive samples are grouped into door-open/close segments by timestamp "
+                "gaps and open/close command changes (or by a `segment_id` column, if the file "
+                "already has one).\n"
+                "- Each segment's minimum and mean motor current feed a Firth-penalised logistic "
+                "regression fitted offline on labeled segments (coefficients reproduced in "
+                "`door_features.py`).\n"
+                "- A segment is flagged `Abnormal resistance` when the fitted probability clears "
+                "a threshold chosen from the labeled data's class gap."
+            )
 
 if st.button("← Back to overview", type="secondary"):
     st.switch_page("app.py")
