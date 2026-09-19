@@ -1,4 +1,3 @@
-import tempfile
 import zipfile
 from pathlib import Path
 
@@ -15,6 +14,7 @@ st.set_page_config(page_title="Rail Corrugation | NebulaX PS3", page_icon="🛤�
 inject_download_button_style()
 
 CLASS_COLORS = {"Normal": THEME["success"], "Side I": THEME["warning"], "Side II": THEME["rail_red"]}
+RESULTS_KEY = "rail_results"
 
 
 @st.cache_resource
@@ -22,15 +22,33 @@ def get_model_bundle() -> dict:
     return rc.load_model()
 
 
-def iter_uploaded_files(uploaded_files):
-    """Yield (file_id, local_path) pairs, expanding any uploaded zip archive into its members.
+def count_items(uploaded_files) -> int:
+    """How many files will be scored (zip archives count as their members)."""
+    total = 0
+    for uploaded in uploaded_files:
+        uploaded.seek(0)
+        try:
+            if zipfile.is_zipfile(uploaded):
+                uploaded.seek(0)
+                with zipfile.ZipFile(uploaded) as archive:
+                    total += sum(
+                        1 for m in archive.namelist()
+                        if not m.endswith("/") and not Path(m).name.startswith((".", "__"))
+                    )
+            else:
+                total += 1
+        except Exception:
+            total += 1
+    return total
 
-    A problem with one uploaded item (a corrupted zip, an unreadable member) is reported
-    and skipped rather than raised -- previously an error here aborted the whole batch
-    instead of just the offending file, since it happened outside predict_file's own
-    try/except.
+
+def iter_uploaded_files(uploaded_files):
+    """Yield (file_id, file-like) pairs, expanding any uploaded zip archive into its members.
+
+    Files are streamed straight from the upload (no temp-file or in-memory copies). A problem
+    with one uploaded item (a corrupted zip, an unreadable member) is reported by the caller
+    as a skipped file rather than aborting the whole batch.
     """
-    tmp_dir = Path(tempfile.mkdtemp())
     for uploaded in uploaded_files:
         try:
             uploaded.seek(0)
@@ -41,22 +59,16 @@ def iter_uploaded_files(uploaded_files):
                         name = Path(member)
                         if member.endswith("/") or name.name.startswith((".", "__")):
                             continue
-                        try:
-                            dest = tmp_dir / name.name
-                            dest.write_bytes(archive.read(member))
-                            yield name.name, dest
-                        except Exception as exc:
-                            st.warning(f"Skipped {member} inside {uploaded.name}: {exc}")
+                        with archive.open(member) as handle:
+                            yield name.name, handle
             else:
                 uploaded.seek(0)
-                dest = tmp_dir / uploaded.name
-                dest.write_bytes(uploaded.getvalue())
-                yield uploaded.name, dest
+                yield uploaded.name, uploaded
         except Exception as exc:
-            st.warning(f"Skipped {uploaded.name}: couldn't read it as a file or archive ({exc}).")
+            yield uploaded.name, exc
 
 
-def predict_file(path: Path) -> tuple[str, pd.Series]:
+def predict_file(source) -> tuple[str, float]:
     bundle = get_model_bundle()
     model = bundle["model"]
     classes = list(model.classes_)
@@ -64,35 +76,72 @@ def predict_file(path: Path) -> tuple[str, pd.Series]:
     normal = bundle.get("normal_label", "Normal")
     weights = np.array([1.0 if c == normal else boost for c in classes])
 
-    df = pd.read_csv(path)
+    df = pd.read_csv(source)
     row = rc.group_features(*rc.to_arrays(df))
     X = pd.DataFrame([row]).reindex(columns=bundle["base_features"])
     proba = model.predict_proba(X)[0]
-    prediction = classes[int(np.argmax(proba * weights))]
-    return prediction, pd.Series(proba, index=classes)
+    best = int(np.argmax(proba * weights))
+    return classes[best], float(proba[best])
+
+
+def score_all(uploaded_files) -> dict:
+    """Score every file, updating a progress bar as it goes.
+
+    Each update is a Streamlit call, which is also what lets Streamlit interrupt this
+    run promptly if the user changes something -- a long loop with no such calls can't
+    be stopped until it finishes.
+    """
+    total = count_items(uploaded_files)
+    progress = st.progress(0.0, text=f"Scoring 0 / {total} files...")
+    results: dict[str, tuple[str, float]] = {}
+    skipped: dict[str, str] = {}
+
+    for done, (file_id, source) in enumerate(iter_uploaded_files(uploaded_files), start=1):
+        if isinstance(source, Exception):
+            skipped[file_id] = f"couldn't read it as a file or archive ({source})"
+        else:
+            try:
+                results[file_id] = predict_file(source)
+            except Exception as exc:
+                skipped[file_id] = f"couldn't read it as vibration/shock data ({exc})"
+        progress.progress(min(done / max(total, 1), 1.0), text=f"Scored {done} / {total} files...")
+
+    progress.empty()
+    return {"results": results, "skipped": skipped}
 
 
 st.title("Rail Corrugation subsystem — track condition classifier")
 st.write(
     "Upload raw axle-box vibration/shock data -- one file, several at once, or a zipped folder "
-    "of them -- to classify each file as Normal, Side I, or Side II corrugation."
+    "of them -- then press **Run predictions** to classify each file as Normal, Side I, or "
+    "Side II corrugation."
 )
 
-uploaded_files = st.file_uploader(
-    "Vibration/shock data file(s) (any filename accepted -- content is what's checked)",
-    accept_multiple_files=True,
-)
+with st.form("rail_upload_form"):
+    uploaded_files = st.file_uploader(
+        "Vibration/shock data file(s) (any filename accepted -- content is what's checked)",
+        accept_multiple_files=True,
+    )
+    submitted = st.form_submit_button("Run predictions", type="primary")
 
-if not uploaded_files:
-    st.info("Upload one or more files to see predictions.")
+if submitted:
+    if not uploaded_files:
+        st.warning("Choose at least one file first.")
+    else:
+        st.session_state[RESULTS_KEY] = score_all(uploaded_files)
+
+state = st.session_state.get(RESULTS_KEY)
+
+if state is None:
+    st.info("Choose files above, wait for them to finish uploading, then press Run predictions.")
 else:
-    results: dict[str, tuple[str, pd.Series]] = {}
-    with st.spinner("Extracting bearing features and scoring..."):
-        for file_id, path in iter_uploaded_files(uploaded_files):
-            try:
-                results[file_id] = predict_file(path)
-            except Exception as exc:
-                st.warning(f"Skipped {file_id}: couldn't read it as vibration/shock data ({exc}).")
+    results, skipped = state["results"], state["skipped"]
+
+    if skipped:
+        st.warning(f"Skipped {len(skipped)} file(s) that couldn't be read.")
+        with st.expander("Which files, and why"):
+            for file_id, reason in skipped.items():
+                st.write(f"**{file_id}**: {reason}")
 
     if not results:
         st.error("None of the uploaded files could be scored.")
@@ -111,15 +160,12 @@ else:
         ax.set_title(f"{len(results)} file(s) classified", fontsize=8)
         pie_col, _ = st.columns([1, 3])
         pie_col.pyplot(fig)
+        plt.close(fig)
 
         st.markdown("#### Predictions Preview")
         overview = pd.DataFrame(
-            {
-                "file_id": file_id,
-                "prediction": prediction,
-                "confidence": proba[prediction],
-            }
-            for file_id, (prediction, proba) in results.items()
+            {"file_id": file_id, "prediction": prediction, "confidence": confidence}
+            for file_id, (prediction, confidence) in results.items()
         )
         st.dataframe(
             overview.rename(columns={"file_id": "File", "prediction": "Prediction", "confidence": "Confidence"}).style.format({"Confidence": "{:.0%}"}),
